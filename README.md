@@ -1,5 +1,10 @@
 # Red Pill - Backup & Restore for Omarchy
 
+
+## 🎬 Video Demo
+
+[![Watch the video](https://img.youtube.com/vi/yHb9qqGs4dU/0.jpg)](https://youtu.be/yHb9qqGs4dU)
+
 *"You take the red pill, you stay in Hyprland and I show you how deep the rabbit-hole goes..."*
 
 A unified backup and restore system for [Omarchy](https://omarchy.com). Backs up configs and user data to external drives using rsync hardlink snapshots - each backup is a full browseable directory tree, but unchanged files are deduplicated via hardlinks so they use no extra disk space.
