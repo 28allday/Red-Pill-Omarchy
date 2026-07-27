@@ -97,37 +97,55 @@ fi
 update-desktop-database "$HOME/.local/share/applications" >/dev/null 2>&1 || true
 sudo update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
 
-# 4) Remove Hyprland keybinding block from bindings.conf
-BINDINGS_FILE="$HOME/.config/hypr/bindings.conf"
-if [[ -f "$BINDINGS_FILE" ]] && grep -q '# Red Pill Backup TUI' "$BINDINGS_FILE"; then
-  # Remove the block between "# Red Pill Backup TUI" and "# End Red Pill Backup TUI" (inclusive)
-  sed -i '/# Red Pill Backup TUI/,/# End Red Pill Backup TUI/d' "$BINDINGS_FILE"
+# 4) Remove Hyprland keybinding block.
+# Omarchy 4 keeps bindings in bindings.lua, Omarchy 3 in bindings.conf — an
+# upgraded machine can have both, so clean whichever carries our marker.
+_removed_bind=0
+_removed_lua=0
+for BINDINGS_FILE in "$HOME/.config/hypr/bindings.lua" "$HOME/.config/hypr/bindings.conf"; do
+  [[ -f "$BINDINGS_FILE" ]] || continue
+  grep -q 'Red Pill Backup TUI' "$BINDINGS_FILE" || continue
+  [[ "$BINDINGS_FILE" == *.lua ]] && _removed_lua=1
+  # Remove the block between the start and end markers (inclusive), in either
+  # comment syntax
+  sed -i '/^[-#]* *Red Pill Backup TUI/,/^[-#]* *End Red Pill Backup TUI/d' "$BINDINGS_FILE"
   # Clean up any resulting double blank lines
   sed -i '/^$/N;/^\n$/d' "$BINDINGS_FILE"
   _ok "Removed Red Pill keybinding and window rules from $BINDINGS_FILE"
+  _removed_bind=1
+done
 
-  # Remove live Hyprland bindings if running
+if (( _removed_bind )); then
+  # Remove live Hyprland bindings if running. The Lua parser rejects
+  # `hyprctl keyword`, so reload the config there instead.
   if command -v hyprctl >/dev/null 2>&1 && hyprctl monitors -j &>/dev/null; then
-    hyprctl keyword unbind "SUPER ALT, B" >/dev/null 2>&1 || true
+    if (( _removed_lua )); then
+      hyprctl reload >/dev/null 2>&1 || true
+    else
+      hyprctl keyword unbind "SUPER ALT, B" >/dev/null 2>&1 || true
+    fi
     _ok "Removed live Hyprland keybinding"
   fi
 else
-  _skip "Hyprland keybinding in bindings.conf"
+  _skip "Hyprland keybinding (not found in bindings.lua or bindings.conf)"
 fi
 
-# 5) Remove redpill-notify from Hyprland autostart
-AUTOSTART_FILE="$HOME/.config/hypr/autostart.conf"
-if [[ -f "$AUTOSTART_FILE" ]] && grep -q 'redpill-notify' "$AUTOSTART_FILE"; then
-  sed -i '/# Red Pill backup reminder on login/d' "$AUTOSTART_FILE"
-  sed -i '/exec-once = redpill-notify/d' "$AUTOSTART_FILE"
+# 5) Remove redpill-notify from Hyprland autostart (both flavours)
+_removed_autostart=0
+for AUTOSTART_FILE in "$HOME/.config/hypr/autostart.lua" "$HOME/.config/hypr/autostart.conf"; do
+  [[ -f "$AUTOSTART_FILE" ]] || continue
+  grep -q 'redpill-notify' "$AUTOSTART_FILE" || continue
+  sed -i '/Red Pill backup reminder on login/d' "$AUTOSTART_FILE"
+  sed -i '/End Red Pill backup reminder/d' "$AUTOSTART_FILE"
+  sed -i '/redpill-notify/d' "$AUTOSTART_FILE"
   # Clean up any resulting double blank lines
   sed -i '/^$/N;/^\n$/d' "$AUTOSTART_FILE"
   _ok "Removed redpill-notify from $AUTOSTART_FILE"
-else
-  _skip "redpill-notify in autostart.conf"
-fi
+  _removed_autostart=1
+done
+(( _removed_autostart )) || _skip "redpill-notify in Hyprland autostart"
 
-# 6) Remove Walker custom command entry for RED PILL
+# 6) Remove Walker custom command entry for RED PILL (Omarchy 3 only)
 WCONF="$HOME/.config/walker/config.toml"
 if [[ -f "$WCONF" ]] && grep -q 'label = "RED PILL"' "$WCONF"; then
   # Remove the [[builtins.custom_commands.entries]] block for RED PILL
@@ -159,8 +177,8 @@ else
   _skip "RED PILL in Walker config"
 fi
 
-# 7) Kill walker to refresh
-pkill -x walker >/dev/null 2>&1 || true
+# 7) Kill walker to refresh (Omarchy 3 only — Omarchy 4 has no Walker)
+command -v walker >/dev/null 2>&1 && pkill -x walker >/dev/null 2>&1 || true
 
 # 8) Ask about config and state directories
 echo

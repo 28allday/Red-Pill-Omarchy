@@ -5,8 +5,10 @@ set -euo pipefail
 # Never edits icons or your System menu.
 
 # 0) Deps — check only, these all ship with omarchy
+# NB: no terminal is listed here. Omarchy 4 lets the user pick their terminal
+# (xdg-terminal-exec resolves it), so pulling in a specific one would be wrong.
 missing=()
-for pkg in rsync libnewt zstd alacritty desktop-file-utils; do
+for pkg in rsync libnewt zstd desktop-file-utils; do
   pacman -Q "$pkg" &>/dev/null || missing+=("$pkg")
 done
 if (( ${#missing[@]} > 0 )); then
@@ -95,6 +97,47 @@ have(){ command -v "$1" >/dev/null 2>&1; }
 timestamp(){ date +"%Y-%m-%d_%H-%M-%S"; }
 hosttag(){ hostnamectl --static 2>/dev/null || hostname; }
 choose_comp(){ have zstd && echo zstd || echo gzip; }
+
+# ── Omarchy theme name ──
+# Omarchy 4 moved current-theme state to ~/.local/state/omarchy (which is
+# excluded from backups), Omarchy 3 kept it in ~/.config/omarchy.
+current_theme_name(){
+  local f
+  for f in "$HOME/.local/state/omarchy/current/theme.name" \
+           "$HOME/.config/omarchy/current/theme.name"; do
+    if [[ -f "$f" ]]; then
+      head -n1 "$f" 2>/dev/null | tr -d '[:space:]'
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Theme recorded in a snapshot's backup.log, falling back to the Omarchy 3
+# location inside the just-restored $HOME (older backups have no Theme: line).
+snapshot_theme_name(){
+  local log="${1:-}" t=""
+  if [[ -f "$log" ]]; then
+    t="$(grep -oP '^Theme:\s+\K.*' "$log" 2>/dev/null | head -n1)" || t=""
+  fi
+  if [[ -z "$t" && -f "$HOME/.config/omarchy/current/theme.name" ]]; then
+    t="$(head -n1 "$HOME/.config/omarchy/current/theme.name" 2>/dev/null)" || t=""
+  fi
+  printf '%s' "$(printf '%s' "$t" | tr -d '[:space:]')"
+}
+
+# Reapply a theme to the running session. Silent no-op if we don't know one.
+reapply_theme(){
+  local t="${1:-}"
+  [[ -n "$t" ]] || return 0
+  have omarchy-theme-set || return 0
+  _info "Reapplying theme" "$t"
+  if omarchy-theme-set "$t" >/dev/null 2>&1; then
+    _ok "Theme '$t' applied to running session"
+  else
+    _warn "Could not apply theme '$t' — is it installed on this machine?"
+  fi
+}
 
 # ── Prompt to reboot after restore ──
 prompt_reboot(){
@@ -573,6 +616,9 @@ mk_backup(){
     echo "Hostname:    $(hosttag)"
     echo "User:        $USER"
     echo "Home:        $HOME"
+    # Recorded here because Omarchy 4 keeps the current theme in
+    # ~/.local/state/omarchy, which the default excludes skip.
+    echo "Theme:       $(current_theme_name 2>/dev/null || echo unknown)"
     echo
   } > "$logfile"
 
@@ -805,14 +851,29 @@ if [[ -n "$OLD_HOME" && "$OLD_HOME" != "$HOME" ]]; then
   echo "  ${_green}✓${_reset} Paths updated for new home directory"
 fi
 
-# Reapply omarchy theme if available
-THEME_NAME_FILE="$HOME/.config/omarchy/current/theme.name"
-if command -v omarchy-theme-set >/dev/null 2>&1 && [[ -f "$THEME_NAME_FILE" ]]; then
-  RESTORED_THEME="$(cat "$THEME_NAME_FILE")"
-  if [[ -n "$RESTORED_THEME" ]]; then
-    echo "  Applying theme: $RESTORED_THEME"
-    omarchy-theme-set "$RESTORED_THEME" >/dev/null 2>&1 || true
+# Reapply omarchy theme if available.
+# Omarchy 4 keeps the current theme in ~/.local/state/omarchy (not backed up),
+# so the snapshot's backup.log is the source of truth; fall back to the
+# Omarchy 3 path for snapshots taken before that line existed.
+RESTORED_THEME=""
+if [[ -f "$BACKUP_LOG" ]]; then
+  RESTORED_THEME="$(grep -oP '^Theme:\s+\K.*' "$BACKUP_LOG" 2>/dev/null | head -n1)" || RESTORED_THEME=""
+fi
+if [[ -z "$RESTORED_THEME" || "$RESTORED_THEME" == "unknown" ]]; then
+  if [[ -f "$HOME/.config/omarchy/current/theme.name" ]]; then
+    RESTORED_THEME="$(head -n1 "$HOME/.config/omarchy/current/theme.name" 2>/dev/null)" || RESTORED_THEME=""
+  else
+    RESTORED_THEME=""
+  fi
+fi
+RESTORED_THEME="$(printf '%s' "$RESTORED_THEME" | tr -d '[:space:]')"
+
+if command -v omarchy-theme-set >/dev/null 2>&1 && [[ -n "$RESTORED_THEME" ]]; then
+  echo "  Applying theme: $RESTORED_THEME"
+  if omarchy-theme-set "$RESTORED_THEME" >/dev/null 2>&1; then
     echo "  ${_green}✓${_reset} Theme applied"
+  else
+    echo "  ${_yellow}⚠${_reset} Could not apply theme '$RESTORED_THEME' — is it installed?"
   fi
 fi
 
@@ -894,6 +955,11 @@ config_backup(){
     tar -czpf "$out" "${rels[@]}"
   fi
   popd >/dev/null
+
+  # Sidecar with the active theme — the tarball itself can't carry it on
+  # Omarchy 4, where theme state lives outside ~/.config.
+  current_theme_name > "${out}.theme" 2>/dev/null || rm -f "${out}.theme"
+
   _ok "Config backup written: $out"
 }
 
@@ -1299,18 +1365,7 @@ restore_snapshot(){
   fix_restored_paths "$source/backup.log"
 
   # Reapply omarchy theme so the restored theme takes effect in the running session
-  if have omarchy-theme-set; then
-    local theme_name_file="$HOME/.config/omarchy/current/theme.name"
-    if [[ -f "$theme_name_file" ]]; then
-      local restored_theme
-      restored_theme="$(cat "$theme_name_file")"
-      if [[ -n "$restored_theme" ]]; then
-        _info "Reapplying theme" "$restored_theme"
-        omarchy-theme-set "$restored_theme" >/dev/null 2>&1 || true
-        _ok "Theme '$restored_theme' applied to running session"
-      fi
-    fi
-  fi
+  reapply_theme "$(snapshot_theme_name "$source/backup.log")"
 
   prompt_reboot
 }
@@ -1346,19 +1401,14 @@ restore_local(){
     rm -f "$tmp_log"
   fi
 
-  # Reapply omarchy theme so the restored theme takes effect in the running session
-  if have omarchy-theme-set; then
-    local theme_name_file="$HOME/.config/omarchy/current/theme.name"
-    if [[ -f "$theme_name_file" ]]; then
-      local restored_theme
-      restored_theme="$(cat "$theme_name_file")"
-      if [[ -n "$restored_theme" ]]; then
-        _info "Reapplying theme" "$restored_theme"
-        omarchy-theme-set "$restored_theme" >/dev/null 2>&1 || true
-        _ok "Theme '$restored_theme' applied to running session"
-      fi
-    fi
+  # Reapply omarchy theme — prefer the sidecar written alongside the tarball,
+  # else whatever the Omarchy 3 config tree carried
+  local local_theme=""
+  if [[ -f "${a}.theme" ]]; then
+    local_theme="$(head -n1 "${a}.theme" 2>/dev/null | tr -d '[:space:]')" || local_theme=""
   fi
+  [[ -n "$local_theme" ]] || local_theme="$(snapshot_theme_name "")"
+  reapply_theme "$local_theme"
 
   prompt_reboot
 }
@@ -1721,143 +1771,232 @@ if ! sudo chmod +x /usr/local/bin/bluepill; then
   exit 1
 fi
 
-# 3) Applications entry — write to BOTH system & user dirs
+# 3) Work out how to open the TUI in a terminal window.
+# Omarchy 4 resolves the user's chosen terminal through xdg-terminal-exec, so
+# prefer that and only fall back to probing individual terminals.
+#
+# The window is identified by app-id/class rather than title: the same string
+# has to survive a Lua string, a Hyprland exec (which goes through /bin/sh) and
+# a .desktop Exec key, and an unspaced app-id needs no quoting in any of them.
+# It must contain a dot — ghostty rejects app-ids that don't look like an ID.
+REDPILL_APPID="TUI.redpill"
+
+REDPILL_LAUNCH=""
+if command -v xdg-terminal-exec >/dev/null 2>&1; then
+  REDPILL_LAUNCH="xdg-terminal-exec --app-id=$REDPILL_APPID -e redpill"
+elif command -v ghostty >/dev/null 2>&1; then
+  REDPILL_LAUNCH="ghostty --class=$REDPILL_APPID -e redpill"
+elif command -v kitty >/dev/null 2>&1; then
+  REDPILL_LAUNCH="kitty --class=$REDPILL_APPID redpill"
+elif command -v alacritty >/dev/null 2>&1; then
+  REDPILL_LAUNCH="alacritty --class $REDPILL_APPID -e redpill"
+elif command -v foot >/dev/null 2>&1; then
+  REDPILL_LAUNCH="foot --app-id=$REDPILL_APPID redpill"
+else
+  echo "Warning: no supported terminal found — run 'redpill' from a shell instead" >&2
+fi
+
+# With no terminal available, fall back to a Terminal=true desktop entry so the
+# launcher still has something to run.
+if [[ -n "$REDPILL_LAUNCH" ]]; then
+  REDPILL_EXEC="$REDPILL_LAUNCH"
+  REDPILL_TERMINAL_FIELD="false"
+else
+  REDPILL_EXEC="redpill"
+  REDPILL_TERMINAL_FIELD="true"
+fi
+
+# 4) Applications entry — write to BOTH system & user dirs
 USER_DESK="$HOME/.local/share/applications/redpill.desktop"
 SYS_DESK="/usr/share/applications/redpill.desktop"
 
-mkdir -p "$(dirname "$USER_DESK")"
-cat > "$USER_DESK" <<'DESK'
+write_desktop_entry(){
+  cat <<DESK
 [Desktop Entry]
 Name=RED PILL
 Comment=Unified backup & restore for Hyprland configs and user data
-Exec=alacritty --title "RED PILL" -e redpill
-Terminal=false
+Exec=${REDPILL_EXEC}
+Terminal=${REDPILL_TERMINAL_FIELD}
 Type=Application
 Categories=System;Utility;
 NoDisplay=false
 StartupNotify=false
 Keywords=hyprland;backup;restore;configs;redpill;bluepill;rsync;
 DESK
+}
 
-if ! sudo tee "$SYS_DESK" >/dev/null <<'DESK'; then
-[Desktop Entry]
-Name=RED PILL
-Comment=Unified backup & restore for Hyprland configs and user data
-Exec=alacritty --title "RED PILL" -e redpill
-Terminal=false
-Type=Application
-Categories=System;Utility;
-NoDisplay=false
-StartupNotify=false
-Keywords=hyprland;backup;restore;configs;redpill;bluepill;rsync;
-DESK
+mkdir -p "$(dirname "$USER_DESK")"
+write_desktop_entry > "$USER_DESK"
+
+if ! write_desktop_entry | sudo tee "$SYS_DESK" >/dev/null; then
   echo "Warning: Failed to create system desktop entry" >&2
 fi
 
 update-desktop-database "$HOME/.local/share/applications" >/dev/null 2>&1 || true
 sudo update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
 
-# 4) Walker: unhide Applications (sed-only) + add custom command safety net
+# 5) Walker: unhide Applications (sed-only) + add custom command safety net.
+# Omarchy 4 dropped Walker for the Quickshell menu, which reads .desktop files
+# directly — so this whole block only applies where Walker is actually present.
 WCONF="$HOME/.config/walker/config.toml"
-mkdir -p "$(dirname "$WCONF")"
 
-if [ ! -f "$WCONF" ]; then
-  cat >"$WCONF" <<'TOML'
-[builtins.applications]
-launch_prefix = "uwsm app -- "
-hidden = false
-
-[builtins.custom_commands]
-hidden = false
-
-[[builtins.custom_commands.entries]]
-label = "RED PILL"
-command = "alacritty --title 'RED PILL' -e redpill"
-keywords = ["redpill","backup","restore","hyprland"]
-icon = ""
-TOML
+if ! command -v walker >/dev/null 2>&1; then
+  echo "Walker not installed — skipping launcher config (Omarchy 4 indexes .desktop entries directly)"
 else
-  if grep -q '^\[builtins\.applications\]' "$WCONF"; then
-    sed -i '/^\[builtins\.applications\]/,/^\[/{s/^\s*hidden\s*=.*/hidden = false/}' "$WCONF"
-    if ! sed -n '/^\[builtins\.applications\]/,/^\[/{/^\s*hidden\s*=/p}' "$WCONF" | grep -q .; then
-      sed -i '/^\[builtins\.applications\]/a hidden = false' "$WCONF"
-    fi
-    if ! sed -n '/^\[builtins\.applications\]/,/^\[/{/^\s*launch_prefix\s*=/p}' "$WCONF" | grep -q .; then
-      sed -i '/^\[builtins\.applications\]/a launch_prefix = "uwsm app -- "' "$WCONF"
-    fi
+  mkdir -p "$(dirname "$WCONF")"
+
+  if [ ! -f "$WCONF" ]; then
+    cat >"$WCONF" <<TOML
+[builtins.applications]
+launch_prefix = "uwsm app -- "
+hidden = false
+
+[builtins.custom_commands]
+hidden = false
+
+[[builtins.custom_commands.entries]]
+label = "RED PILL"
+command = "${REDPILL_EXEC}"
+keywords = ["redpill","backup","restore","hyprland"]
+icon = ""
+TOML
   else
-    cat >>"$WCONF" <<'TOML'
+    if grep -q '^\[builtins\.applications\]' "$WCONF"; then
+      sed -i '/^\[builtins\.applications\]/,/^\[/{s/^\s*hidden\s*=.*/hidden = false/}' "$WCONF"
+      if ! sed -n '/^\[builtins\.applications\]/,/^\[/{/^\s*hidden\s*=/p}' "$WCONF" | grep -q .; then
+        sed -i '/^\[builtins\.applications\]/a hidden = false' "$WCONF"
+      fi
+      if ! sed -n '/^\[builtins\.applications\]/,/^\[/{/^\s*launch_prefix\s*=/p}' "$WCONF" | grep -q .; then
+        sed -i '/^\[builtins\.applications\]/a launch_prefix = "uwsm app -- "' "$WCONF"
+      fi
+    else
+      cat >>"$WCONF" <<'TOML'
 
 [builtins.applications]
 launch_prefix = "uwsm app -- "
 hidden = false
 TOML
-  fi
+    fi
 
-  if ! grep -q '^\[builtins\.custom_commands\]' "$WCONF"; then
-    cat >>"$WCONF" <<'TOML'
+    if ! grep -q '^\[builtins\.custom_commands\]' "$WCONF"; then
+      cat >>"$WCONF" <<'TOML'
 
 [builtins.custom_commands]
 hidden = false
 TOML
-  fi
-  if ! grep -q 'label = "RED PILL"' "$WCONF"; then
-    cat >>"$WCONF" <<'TOML'
+    fi
+    if ! grep -q 'label = "RED PILL"' "$WCONF"; then
+      cat >>"$WCONF" <<TOML
 
 [[builtins.custom_commands.entries]]
 label = "RED PILL"
-command = "alacritty --title 'RED PILL' -e redpill"
+command = "${REDPILL_EXEC}"
 keywords = ["redpill","backup","restore","hyprland"]
 icon = ""
 TOML
+    fi
   fi
 fi
 
-# 5) Hyprland keybinding: Super+Alt+B → floating RED PILL window
-BINDINGS_FILE="$HOME/.config/hypr/bindings.conf"
+# 6) Hyprland keybinding: Super+Alt+B → floating RED PILL window
+#
+# Omarchy 4 / Hyprland 0.56 use the Lua config provider: ~/.config/hypr/*.conf
+# is never read, so the binding has to go into bindings.lua. Omarchy 3 boxes
+# still use bindings.conf. Detect which, and write the matching syntax.
+BINDINGS_LUA="$HOME/.config/hypr/bindings.lua"
+BINDINGS_CONF="$HOME/.config/hypr/bindings.conf"
 
-# Detect preferred terminal with --title support
-REDPILL_TERM=""
-if command -v ghostty >/dev/null 2>&1; then
-  REDPILL_TERM="ghostty --title='RED PILL' -e"
-elif command -v kitty >/dev/null 2>&1; then
-  REDPILL_TERM="kitty --title='RED PILL' -e"
-elif command -v alacritty >/dev/null 2>&1; then
-  REDPILL_TERM="alacritty --title='RED PILL' -e"
-elif command -v foot >/dev/null 2>&1; then
-  REDPILL_TERM="foot --title='RED PILL' --"
+hypr_config_flavour(){
+  if [[ -f "$BINDINGS_LUA" ]]; then
+    echo lua
+  elif [[ -f "$BINDINGS_CONF" ]]; then
+    echo conf
+  elif hyprctl systeminfo 2>/dev/null | grep -q 'configProvider:[[:space:]]*lua'; then
+    # Lua session that has no personal bindings file yet — create one
+    echo lua
+  else
+    echo none
+  fi
+}
+
+HYPR_FLAVOUR="$(hypr_config_flavour)"
+
+# The keybinding needs a terminal; the autostart entry further down doesn't.
+BIND_FLAVOUR="$HYPR_FLAVOUR"
+if [[ -z "$REDPILL_LAUNCH" ]]; then
+  echo "Skipping Hyprland keybinding — no terminal to launch the TUI in" >&2
+  BIND_FLAVOUR="none"
 fi
 
-if [[ -n "$REDPILL_TERM" && -f "$BINDINGS_FILE" ]]; then
-  if ! grep -q "# Red Pill Backup TUI" "$BINDINGS_FILE"; then
-    echo "Adding keybinding (Super+Alt+B) to $BINDINGS_FILE"
-    {
-      echo ""
-      echo "# Red Pill Backup TUI"
-      echo "windowrule = match:title RED PILL, float on"
-      echo "windowrule = match:title RED PILL, size 800 600"
-      echo "windowrule = match:title RED PILL, center on"
-      echo "windowrule = match:title RED PILL, pin on"
-      echo "bindd = SUPER ALT, B, Red Pill Backup, exec, $REDPILL_TERM redpill"
-      echo "# End Red Pill Backup TUI"
-    } >> "$BINDINGS_FILE"
-  fi
+# Machines upgraded from Omarchy 3 keep an inert bindings.conf. Strip any block
+# we left there so the binding isn't defined in two places.
+if [[ "$HYPR_FLAVOUR" == "lua" && -f "$BINDINGS_CONF" ]] && \
+   grep -q '# Red Pill Backup TUI' "$BINDINGS_CONF"; then
+  sed -i '/# Red Pill Backup TUI/,/# End Red Pill Backup TUI/d' "$BINDINGS_CONF"
+  sed -i '/^$/N;/^\n$/d' "$BINDINGS_CONF"
+  echo "Removed stale Red Pill block from $BINDINGS_CONF (Hyprland no longer reads it)"
+fi
 
-  # Apply dynamically so no Hyprland reload needed
-  if command -v hyprctl >/dev/null 2>&1 && hyprctl monitors -j &>/dev/null; then
+case "$BIND_FLAVOUR" in
+  lua)
+    mkdir -p "$(dirname "$BINDINGS_LUA")"
+    [[ -f "$BINDINGS_LUA" ]] || : > "$BINDINGS_LUA"
+    if ! grep -q -- "-- Red Pill Backup TUI" "$BINDINGS_LUA"; then
+      echo "Adding keybinding (Super+Alt+B) to $BINDINGS_LUA"
+      # One property per o.window() call, matching Omarchy's own style
+      {
+        echo ""
+        echo "-- Red Pill Backup TUI"
+        echo "o.window({ class = \"^${REDPILL_APPID}\$\" }, { float = true })"
+        echo "o.window({ class = \"^${REDPILL_APPID}\$\" }, { center = true })"
+        echo "o.window({ class = \"^${REDPILL_APPID}\$\" }, { size = { 800, 600 } })"
+        echo "o.window({ class = \"^${REDPILL_APPID}\$\" }, { pin = true })"
+        echo "o.bind(\"SUPER + ALT + B\", \"Red Pill Backup\", \"${REDPILL_LAUNCH}\")"
+        echo "-- End Red Pill Backup TUI"
+      } >> "$BINDINGS_LUA"
+    fi
+    ;;
+  conf)
+    if ! grep -q "# Red Pill Backup TUI" "$BINDINGS_CONF"; then
+      echo "Adding keybinding (Super+Alt+B) to $BINDINGS_CONF"
+      {
+        echo ""
+        echo "# Red Pill Backup TUI"
+        echo "windowrule = match:class ^${REDPILL_APPID}\$, float on"
+        echo "windowrule = match:class ^${REDPILL_APPID}\$, size 800 600"
+        echo "windowrule = match:class ^${REDPILL_APPID}\$, center on"
+        echo "windowrule = match:class ^${REDPILL_APPID}\$, pin on"
+        echo "bindd = SUPER ALT, B, Red Pill Backup, exec, $REDPILL_LAUNCH"
+        echo "# End Red Pill Backup TUI"
+      } >> "$BINDINGS_CONF"
+    fi
+    ;;
+  *)
+    echo "No Hyprland bindings file found — skipping Super+Alt+B keybinding" >&2
+    ;;
+esac
+
+# Apply to the running session so the binding works without a logout.
+if [[ "$BIND_FLAVOUR" != "none" ]] && command -v hyprctl >/dev/null 2>&1 && hyprctl monitors -j &>/dev/null; then
+  if [[ "$BIND_FLAVOUR" == "lua" ]]; then
+    # The Lua parser rejects `hyprctl keyword` ("can't work with non-legacy
+    # parsers"), so re-read the config instead. Hyprland usually autoreloads on
+    # write anyway; this just makes it deterministic.
+    hyprctl reload >/dev/null 2>&1 || true
+  else
     hyprctl keyword unbind "SUPER ALT, B" >/dev/null 2>&1 || true
-    hyprctl keyword windowrule "match:title RED PILL, float on" >/dev/null 2>&1 || true
-    hyprctl keyword windowrule "match:title RED PILL, size 800 600" >/dev/null 2>&1 || true
-    hyprctl keyword windowrule "match:title RED PILL, center on" >/dev/null 2>&1 || true
-    hyprctl keyword windowrule "match:title RED PILL, pin on" >/dev/null 2>&1 || true
-    hyprctl keyword bindd "SUPER ALT, B, Red Pill Backup, exec, $REDPILL_TERM redpill" >/dev/null 2>&1 || true
+    hyprctl keyword windowrule "match:class ^${REDPILL_APPID}\$, float on" >/dev/null 2>&1 || true
+    hyprctl keyword windowrule "match:class ^${REDPILL_APPID}\$, size 800 600" >/dev/null 2>&1 || true
+    hyprctl keyword windowrule "match:class ^${REDPILL_APPID}\$, center on" >/dev/null 2>&1 || true
+    hyprctl keyword windowrule "match:class ^${REDPILL_APPID}\$, pin on" >/dev/null 2>&1 || true
+    hyprctl keyword bindd "SUPER ALT, B, Red Pill Backup, exec, $REDPILL_LAUNCH" >/dev/null 2>&1 || true
   fi
 fi
 
-# 6) Config directory (no custom theming - uses system defaults)
+# 7) Config directory (no custom theming - uses system defaults)
 mkdir -p "$HOME/.config/redpill"
 
-# 7) Create RECOVERY.txt guide
+# 8) Create RECOVERY.txt guide
 cat > "$HOME/.config/redpill/RECOVERY.txt" <<'RECOVERY'
 RED PILL - Recovery Guide
 ==============================
@@ -1939,7 +2078,7 @@ SNAPSHOT STRUCTURE (on external drive):
   You can browse any snapshot directly in a file manager.
 RECOVERY
 
-# 8) Auto-backup on shutdown — systemd service + wrapper script
+# 9) Auto-backup on shutdown — systemd service + wrapper script
 # Wrapper: checks preconditions silently, runs full backup if ready
 sudo tee /usr/local/bin/redpill-autobackup >/dev/null <<'AUTOBACKUP'
 #!/usr/bin/env bash
@@ -2041,12 +2180,14 @@ EOF
 sudo systemctl daemon-reload
 # Don't enable here — user opts in via TUI menu option 11
 
-# 9) Login notification checker — reminds user to plug in backup drive
+# 10) Login notification checker — reminds user to plug in backup drive
 sudo tee /usr/local/bin/redpill-notify >/dev/null <<'NOTIFY'
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Wait for notification daemon (mako) to be ready
+# Wait for the notification daemon to claim the bus name.
+# (mako on Omarchy 3, omarchy-shell/Quickshell on Omarchy 4 — either way it's
+# org.freedesktop.Notifications, and either way it isn't up instantly.)
 sleep 5
 
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/redpill"
@@ -2077,24 +2218,54 @@ fi
 NOTIFY
 sudo chmod +x /usr/local/bin/redpill-notify
 
-# Add redpill-notify to Hyprland autostart (once only)
-AUTOSTART_FILE="$HOME/.config/hypr/autostart.conf"
-if [[ -f "$AUTOSTART_FILE" ]]; then
-  if ! grep -q 'redpill-notify' "$AUTOSTART_FILE"; then
-    echo "Adding redpill-notify to $AUTOSTART_FILE"
-    {
-      echo ""
-      echo "# Red Pill backup reminder on login"
-      echo "exec-once = redpill-notify"
-    } >> "$AUTOSTART_FILE"
-  fi
+# Add redpill-notify to Hyprland autostart (once only).
+# Same .conf-vs-.lua split as the keybinding above.
+AUTOSTART_LUA="$HOME/.config/hypr/autostart.lua"
+AUTOSTART_CONF="$HOME/.config/hypr/autostart.conf"
+
+# Same cleanup as the bindings: drop our line from the now-inert .conf
+if [[ "$HYPR_FLAVOUR" == "lua" && -f "$AUTOSTART_CONF" ]] && \
+   grep -q 'redpill-notify' "$AUTOSTART_CONF"; then
+  sed -i '/# Red Pill backup reminder on login/d;/redpill-notify/d' "$AUTOSTART_CONF"
+  sed -i '/^$/N;/^\n$/d' "$AUTOSTART_CONF"
+  echo "Removed stale redpill-notify line from $AUTOSTART_CONF (Hyprland no longer reads it)"
 fi
 
-# 10) Reindex and restart Walker so the new entry is searchable immediately
+case "$HYPR_FLAVOUR" in
+  lua)
+    mkdir -p "$(dirname "$AUTOSTART_LUA")"
+    [[ -f "$AUTOSTART_LUA" ]] || : > "$AUTOSTART_LUA"
+    if ! grep -q 'redpill-notify' "$AUTOSTART_LUA"; then
+      echo "Adding redpill-notify to $AUTOSTART_LUA"
+      {
+        echo ""
+        echo "-- Red Pill backup reminder on login"
+        echo 'o.launch_on_start("redpill-notify")'
+        echo "-- End Red Pill backup reminder"
+      } >> "$AUTOSTART_LUA"
+    fi
+    ;;
+  conf)
+    if [[ -f "$AUTOSTART_CONF" ]] && ! grep -q 'redpill-notify' "$AUTOSTART_CONF"; then
+      echo "Adding redpill-notify to $AUTOSTART_CONF"
+      {
+        echo ""
+        echo "# Red Pill backup reminder on login"
+        echo "exec-once = redpill-notify"
+      } >> "$AUTOSTART_CONF"
+    fi
+    ;;
+  *)
+    echo "No Hyprland autostart file found — login reminders won't run" >&2
+    ;;
+esac
+
+# 11) Reindex launcher entries so RED PILL is searchable immediately
 update-desktop-database "$HOME/.local/share/applications" >/dev/null 2>&1 || true
 sudo update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
-# Kill walker more safely - only exact process name match
-pkill -x walker >/dev/null 2>&1 || true
+# Omarchy 3: nudge Walker to re-read its index. Omarchy 4's menu watches
+# .desktop dirs itself, so there's nothing to restart there.
+command -v walker >/dev/null 2>&1 && pkill -x walker >/dev/null 2>&1 || true
 
 echo "Installed:"
 echo "  - redpill (TUI) at /usr/local/bin/redpill"

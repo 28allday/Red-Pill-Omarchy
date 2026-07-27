@@ -18,15 +18,17 @@ A unified backup and restore system for [Omarchy](https://omarchy.com). Backs up
 - **Backup verification**: checksum manifests (xxh128 or sha256) with integrity checking
 - **New machine restore**: standalone `restore.sh` written to the backup drive - works without Red Pill installed
 - **Username migration**: automatically fixes paths when restoring to a different username/home directory
-- **Theme restoration**: reapplies Omarchy theme after restore
+- **Theme restoration**: records the active Omarchy theme in the snapshot and reapplies it after restore
 - **Login notifications**: reminds you if no backup in 7+ days
-- **Walker integration**: searchable from the Omarchy launcher
+- **Launcher integration**: searchable from the Omarchy launcher (`Super+Space`)
 - **Hyprland keybind**: `Super+Alt+B` opens a floating TUI window
+- **Omarchy 3 and 4**: detects the Lua config (Omarchy 4 / Quickshell) or the older `.conf` layout and writes whichever the machine actually reads
 
 ## Requirements
 
-- **OS**: [Omarchy](https://omarchy.com) (Arch Linux)
-- **Dependencies**: `rsync`, `libnewt` (whiptail), `zstd`, `alacritty`, `desktop-file-utils` (all ship with Omarchy)
+- **OS**: [Omarchy](https://omarchy.com) 3 or 4 (Arch Linux)
+- **Dependencies**: `rsync`, `libnewt` (whiptail), `zstd`, `desktop-file-utils` (all ship with Omarchy)
+- **Terminal**: whichever one you use — the TUI is launched through `xdg-terminal-exec`, falling back to ghostty/kitty/alacritty/foot
 - **Backup destination**: any external drive (ext4, NTFS, btrfs, exFAT, etc.)
 
 ## Quick Start
@@ -114,9 +116,11 @@ Shows the Matrix quote, then restores from the latest snapshot on your external 
 |------|---------|
 | `~/.local/share/applications/redpill.desktop` | User application menu entry |
 | `/usr/share/applications/redpill.desktop` | System application menu entry |
-| `~/.config/walker/config.toml` | Walker launcher custom command entry |
-| `~/.config/hypr/bindings.conf` | Hyprland keybind (`Super+Alt+B`) + window rules |
-| `~/.config/hypr/autostart.conf` | Login notification autostart |
+| `~/.config/hypr/bindings.lua` | Hyprland keybind (`Super+Alt+B`) + window rules — Omarchy 4 |
+| `~/.config/hypr/autostart.lua` | Login notification autostart — Omarchy 4 |
+| `~/.config/hypr/bindings.conf` | Keybind + window rules — Omarchy 3 |
+| `~/.config/hypr/autostart.conf` | Login notification autostart — Omarchy 3 |
+| `~/.config/walker/config.toml` | Walker custom command entry — Omarchy 3 only |
 
 ### Systemd Service
 
@@ -228,9 +232,9 @@ bash Redpill_uninstall.sh
 The uninstaller removes:
 - All binaries from `/usr/local/bin/`
 - Desktop entries (user + system)
-- Hyprland keybinding and window rules
+- Hyprland keybinding and window rules (`.lua` and `.conf` layouts)
 - Hyprland autostart entry
-- Walker custom command entry
+- Walker custom command entry (Omarchy 3)
 - Systemd auto-backup service
 - Optionally: config and state directories
 
